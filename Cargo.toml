@@ -15,6 +15,6 @@ license = "Apache-2.0"
 maintenance = { status = "actively-developed" }
 
 [dependencies]
-error-chain = "0"
-nom = "5.0.0-beta2" 
-threadpool = "1"
+error-chain = "0.12.4"
+nom = "5.1.2"
+threadpool = "1.8.1"

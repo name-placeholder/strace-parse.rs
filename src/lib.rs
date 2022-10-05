@@ -24,12 +24,12 @@ pub mod errors {
     }
 
     // Inspired by https://github.com/Geal/nom/issues/581
-    impl<E: fmt::Debug + Clone> From<nom::Err<E>> for Error {
-        fn from(error: nom::Err<E>) -> Self {
+    impl<E: fmt::Debug + Clone> From<nom::Err<(&[u8], E)>> for Error {
+        fn from(error: nom::Err<(&[u8], E)>) -> Self {
             let desc = match &error {
                 nom::Err::Incomplete(needed) => format!("ran out of bytes: {:?}", needed),
-                nom::Err::Error(_) => format!("{:?}", error),
-                nom::Err::Failure(_) => format!("{:?}", error),
+                nom::Err::Error((rest, err)) => format!("Error \"{}\" {err:?}", std::str::from_utf8(rest).unwrap()),
+                nom::Err::Failure((rest, err)) => format!("Failure \"{}\" {err:?}", std::str::from_utf8(rest).unwrap()),
             };
 
             Error::from_kind(ErrorKind::NomError(desc))
@@ -78,6 +78,8 @@ pub mod raw {
         Resumed(String),
         /// The process exited
         Exited(u32),
+        /// The process killed
+        Killed(String),
         /// The process was signalled
         Signalled(String),
     }
@@ -134,7 +136,7 @@ pub mod raw {
         /// internally.
         use super::{Call, CallResult, Duration, GenericCall, Syscall};
         use crate::errors::*;
-        use nom::character::complete::digit1;
+        use nom::character::complete::{digit1, alphanumeric1};
         use nom::character::is_space;
         use nom::{
             alt, char, complete, delimited, do_parse, escaped, is_a, is_not, map_res, named,
@@ -210,7 +212,7 @@ pub mod raw {
                 opt!(complete!(take_while!(is_space)))
                     >> r: recognize!(do_parse!(
                         opt!(complete!(terminated!(parse_term, tag!("="))))
-                            >> opt!(complete!(tag!("&")))
+                            >> opt!(complete!(alt!(tag!("&") | tag!("~"))))
                             >> arg: alt!(
                                 // Commented hex
                                 complete!(recognize!(do_parse!(
@@ -303,6 +305,19 @@ pub mod raw {
                         (Call::Exited(ret)))
         );
 
+        // Parse the +++ killed by SIGTERM +++ case
+        named!(
+                parse_kill_event<&[u8], Call>,
+                do_parse!(
+                    ret: delimited!(tag!("+++ killed by "),
+                    map_res!(
+                        alphanumeric1,
+                        std::str::from_utf8
+                    ),
+                    tag!(" +++")) >>
+                    (Call::Killed(ret.to_string())))
+        );
+
         named!(
             eol,
             alt!(complete!(tag!("\r\n")) | complete!(tag!("\n")) | complete!(tag!("\r")))
@@ -342,7 +357,7 @@ pub mod raw {
         named!(
                 pub parse_call<&[u8], Call>,
                 alt!(
-                    complete!(do_parse!(e: parse_exit_event >> (e)))
+                    complete!(alt!(do_parse!(e: parse_exit_event >> (e)) | do_parse!(e: parse_kill_event >> (e))))
                     // <... epoll_wait resumed> ....
                     // must be before unfinished because of:
                     // 15874 20:12:51.109551 <... epoll_wait resumed> <unfinished ...>) = ?
@@ -504,7 +519,7 @@ pub mod raw {
             if unfinished.pid != resumed.pid {
                 return Err("pid mismatch".into());
             }
-            let prefix = if let Call::Unfinished(prefix) = unfinished.call {
+            let mut prefix = if let Call::Unfinished(prefix) = unfinished.call {
                 prefix
             } else {
                 return Err("bad call in unfinished".into());
@@ -515,6 +530,9 @@ pub mod raw {
                 return Err("bad call in resumed".into());
             };
 
+            if prefix.ends_with('}') && suffix.starts_with('<') {
+                prefix.push(' ');
+            }
             let line = prefix + &suffix;
             let (remainder, mut value) = nom!(merge_parser(line.as_bytes()))?;
             if remainder.len() != 0 {
@@ -726,6 +744,43 @@ pub mod raw {
                 );
             }
 
+            #[test]
+            fn parse_resumed_and_unfinished_again_with_curly_brace() {
+                let input = &b"select(0, NULL, NULL, NULL, {tv_sec=0, tv_usec=50000} <unfinished ...>\n"[..];
+                let result = parse_call(input);
+                assert_eq!(
+                    result,
+                    Ok((&b""[..], Call::Unfinished("select(0, NULL, NULL, NULL, {tv_sec=0, tv_usec=50000}".into())))
+                );
+                let u = Syscall::new(
+                    Some(1),
+                    result.unwrap().1,
+                    Some(Duration::from_secs(500)),
+                    None,
+                );
+
+                let input = &b"<... select resumed> <unfinished ...>) = ?\n"[..];
+                let result = parse_call(input);
+                assert_eq!(
+                    result,
+                    Ok((&b""[..], Call::Resumed("<unfinished ...>) = ?\n".into())))
+                );
+                let r = Syscall::new(Some(1), result.unwrap().1, None, None);
+
+                let result = merge_resumed(u, r).unwrap();
+                assert_eq!(
+                    result,
+                    Syscall {
+                        pid: Some(1),
+                        call: Call::Unfinished("select(0, NULL, NULL, NULL, {tv_sec=0, tv_usec=50000}".to_owned()),
+                        start: Some(Duration::from_secs(500)),
+                        stop: None,
+                        duration: None,
+                    }
+                );
+
+            }
+
             // epoll_wait(4,  <unfinished ...>
             // <... epoll_wait resumed> [], 1024, 0) = 0 <0.000542>
             #[test]
@@ -905,6 +960,19 @@ pub mod raw {
                     assert_eq!(result, Ok((&b""[..], output)));
                 }
             }
+
+            #[test]
+            fn tilda_in_arg() {
+                parse_arg(
+                    b"{sa_handler=0x55c563612200, sa_mask=~[RTMIN RT_1], sa_flags=SA_RESTORER, sa_restorer=0x7f71f61fef10}",
+                ).unwrap();
+            }
+
+            #[test]
+            fn killed() {
+                let line = *b"+++ killed by SIGTERM +++\n";
+                parse_call(line.as_ref()).unwrap();
+            }
         }
     }
 
@@ -929,7 +997,7 @@ pub mod raw {
     impl<T: BufRead> ParseLines<T> {
         fn adjust_line(&mut self, parsed: Line) -> Option<Line> {
             self.next_yield += 1;
-            return match parsed {
+            match parsed {
                 Ok(mut value) => {
                     //println!("parsed: {:?}", value);
                     match value.start {
@@ -955,7 +1023,7 @@ pub mod raw {
                     Some(Ok(value))
                 }
                 Err(e) => Some(Err(e)),
-            };
+            }
         }
 
         fn finish_reading(&mut self) {
@@ -964,7 +1032,7 @@ pub mod raw {
             // the current one close (and let blocking iteration
             // terminate correctly)
             let (send, _recv) = channel();
-            std::mem::replace(&mut self.send, send);
+            drop(std::mem::replace(&mut self.send, send));
         }
 
         fn dispatch_line(&mut self) -> Result<()> {
@@ -1174,7 +1242,7 @@ pub mod structure {
                                         if let Some(oldcall) =
                                             self.unfinished.insert(syscall.pid, syscall)
                                         {
-                                            panic!(
+                                            eprintln!(
                                                 "double unfinished rainbow {:?} {:?}",
                                                 &oldcall,
                                                 self.unfinished.get(&oldcall.pid).unwrap()
