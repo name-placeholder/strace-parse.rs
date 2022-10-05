@@ -136,7 +136,7 @@ pub mod raw {
         /// internally.
         use super::{Call, CallResult, Duration, GenericCall, Syscall};
         use crate::errors::*;
-        use nom::character::complete::{digit1, alphanumeric1};
+        use nom::character::complete::{digit1, alphanumeric1, space1};
         use nom::character::is_space;
         use nom::{
             alt, char, complete, delimited, do_parse, escaped, is_a, is_not, map_res, named,
@@ -484,7 +484,7 @@ pub mod raw {
         named!(parse_pid<&[u8], u32>,
                 complete!(map_res!(
                     map_res!(
-                        terminated!(digit1, tag!(" ")),
+                        terminated!(digit1, alt!(tag!("] ") | tag!(" "))),
                         std::str::from_utf8
                     ), |s: &str| s.parse::<u32>()
                 ))
@@ -492,7 +492,9 @@ pub mod raw {
 
         named!(
                 pub parser<&[u8], Syscall>,
-                do_parse!(pid: opt!(parse_pid)  >>
+                do_parse!(
+                    opt!(complete!(tuple!(tag!("[pid"), space1))) >>
+                    pid: opt!(parse_pid)  >>
                     opt!(complete!(tag!(" "))) >>
                     start: parse_start >>
                     call: parse_call >>
